@@ -2,8 +2,15 @@
 package mongo
 
 import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"io"
+	"os"
 	"time"
 
+	"github.com/Sirupsen/logrus"
+	"github.com/fntlnz/gridfsmount/util"
 	"github.com/rs/rest-layer/resource"
 	"golang.org/x/net/context"
 	"gopkg.in/mgo.v2"
@@ -12,9 +19,11 @@ import (
 
 // Handler handles resource storage in a MongoDB collection.
 type Handler struct {
-	session *mgo.Session
-	dbName  string
-	colName string
+	session     *mgo.Session
+	dbName      string
+	colName     string
+	gridfs      bool
+	gridfsfield string
 }
 
 // mongoItem is a bson representation of a resource.Item
@@ -32,6 +41,18 @@ func NewHandler(s *mgo.Session, db, collection string) *Handler {
 		session: s,
 		dbName:  db,
 		colName: collection,
+	}
+}
+
+// NewGridFSHandler creates an new mongo handler
+func NewGridFSHandler(s *mgo.Session, db, collection, field string) *Handler {
+	s.EnsureSafe(&mgo.Safe{})
+	return &Handler{
+		session:     s,
+		dbName:      db,
+		colName:     collection,
+		gridfs:      true,
+		gridfsfield: field,
 	}
 }
 
@@ -91,10 +112,93 @@ func (m *Handler) close(c *mgo.Collection) {
 	c.Database.Session.Close()
 }
 
+func GetBytes(key interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(key)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // Insert inserts new items in the mongo collection
 func (m *Handler) Insert(ctx context.Context, items []*resource.Item) error {
 	mItems := make([]interface{}, len(items))
 	for i, item := range items {
+		for k := range item.Payload {
+			if k == m.gridfsfield {
+				fmt.Printf("key[%s] value[%s]\n", k, item.Payload[k])
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				// With mgo, session.Copy() pulls a connection from the connection pool
+				s := m.session.Copy()
+				// Ensure safe mode is enabled in order to get errors
+				s.EnsureSafe(&mgo.Safe{})
+				// Set a timeout to match the context deadline if any
+				if deadline, ok := ctx.Deadline(); ok {
+					timeout := deadline.Sub(time.Now())
+					if timeout <= 0 {
+						timeout = 0
+					}
+					s.SetSocketTimeout(timeout)
+					s.SetSyncTimeout(timeout)
+				}
+				cgridfs := s.DB(m.dbName).GridFS("files")
+				logrus.Warn("GRIDFS INSERT BEGINS")
+
+				tempname, err := util.TempFileName()
+				if err != nil {
+					return err
+				}
+
+				tempfile, err := os.OpenFile(tempname, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+				if err != nil {
+					logrus.Errorf("An error occurred while opening temporary file for writing: %s", err.Error())
+					return nil
+				}
+
+				item, err := GetBytes(item.Payload[k])
+				if err != nil {
+					logrus.Errorf("An error occurred while getting bytes from payload: %s", err.Error())
+					return nil
+				}
+				_, err = tempfile.Write(item)
+				if err != nil {
+					logrus.Errorf("An error occurred while appending data to temporary file: %s", err.Error())
+					return nil
+				}
+				tempfile.Close()
+
+				tempFile, err := os.Open(tempname)
+				file, err := cgridfs.Create("hasan")
+				if err != nil {
+					logrus.Errorf("An error occurred while creating the file on GridFS: %s", err.Error())
+					return nil
+				}
+
+				defer file.Close()
+				_, err = io.Copy(file, tempFile)
+
+				if err != nil {
+					logrus.Errorf("An error occurred while writing to GridFS: %s", err.Error())
+					return nil
+				}
+
+				file, err = cgridfs.Create("hasan")
+				if mgo.IsDup(err) {
+					// Duplicate ID key
+					err = resource.ErrConflict
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+
+				logrus.Info(file)
+			}
+		}
+
 		mItems[i] = newMongoItem(item)
 	}
 	c, err := m.c(ctx)
